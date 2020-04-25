@@ -1,0 +1,585 @@
+FUNCTION _create_agent(payload, signer, timestamp){
+    SET name = payload.name
+
+    IF (name dose not exist){
+        raise an Invalid Transaction Exception which says agent name cannot be empty.
+    }
+
+    SET address = CALL addressing.make_agent_address(signer)
+    SET container = CALL _get_container(state, address)
+
+    FOR all agents in container.agent{
+        IF (agent's public key equals to signer){}
+        raise an Invalid Transaction Exception which says the agent already exist.
+    }
+
+    SET agent = CALL Agent(
+        public_key = signer, 
+        name = name,
+        timestamp = timestamp,
+    )
+
+    CALL container.entries.extend([agent])
+    CALL container.entries.sort(key=lambda ag: ag.public_key)
+
+    CALL _set_container(state, address, container)    
+}
+
+FUNCTION _create_record(payload, signer, timestamp, state){
+    // Check that the signer is registered.
+    CALL _verify_agent(state, signer)
+
+    // Check that the record doesn't already exist
+    SET record_id = payload.record_id
+
+    IF (record_id doesn't exist){
+        raise an Invalid Transaction Exception which says record id cannot be empty.
+    }
+
+    SET record_address = CALL addressing.make_record_address(record_id)
+    SET record_container = CALL _get_container(state, record_address)
+
+    IF (record_id exist in record_container.entries) {
+        raise Invalid Transaction Exception that says the record (record_id) already exist.
+    }
+
+    // Check that the record type exists.
+    SET type_name = payload.record_type
+    SET record_type = CALL _get_record_type(state, type_name)
+
+    IN type_schemata dictionary SET EACH prob.name = prob in type_schemata.properties
+
+    IN required_properties dictionary SET EACH name AND prob in type_schemata.items() IF prob.required is SET 
+
+    IN provided_properties dictionary SET EACH prob.name = prob in payload.properties
+
+    // Make sure the provided properties have the right type
+    FOR ALL provided_name in provided_properties {
+        SET required_type = type_schemata[provided_name].data_type
+        SET provided_type = provided_properties[provided_name].data_type
+
+        IF (required_type doesn't match with provided_type) {
+            raise Invalid Transaction Exception that says value provided for the (provided_name) is the wrong type.
+        }
+    }
+
+    # Create the record
+    SET record = CALL Record(
+        SET record_type=type_name,
+        SET record_id=record_id,
+        SET final=False,
+    )
+
+    CALL record.owners.extend([
+        CALL Record.AssociatedAgent(
+            SET agent_id=signer,
+            SET timestamp=timestamp,
+        )
+    ])
+
+    CALL record.custodians.extend([
+        CALL Record.AssociatedAgent(
+            SET agent_id=signer,
+            SET timestamp=timestamp,
+        )
+    ])
+
+    CALL record_container.entries.extend([record])
+    CALL record_container.entries.sort(key=lambda rec: rec.record_id)
+
+    CALL _set_container(state, record_address, record_container)
+
+    // Create the associated properties
+    FOR ALL property_name AND prop IN type_schemata.items(){
+        CALL _make_new_property(
+            SET state=state,
+            SET record_id=record_id,
+            SET property_name=property_name,
+            SET data_type=prop.data_type,
+            SET signer=signer,
+        )
+
+        CALL _make_new_property_page(
+            SET state=state,
+            SET timestamp=timestamp,
+            SET record_id=record_id,
+            SET property_name=property_name,
+            SET value=(
+                None if property_name not in provided_properties
+                else provided_properties[property_name]
+            ),
+            SET page_number=1,
+        )
+    }
+}
+
+FUNCTION _finalize_record(payload, signer, timestamp, state) {
+    '''
+    * Check that the signer is both the owner and custodian
+    * Check that the record is not already final
+    '''
+
+    SET record_id = payload.record_id
+
+    SET record AND container AND address = CALL _get_record(state, record_id)
+
+    IF (CALL _is_owner(record,signer) OR CALL is_custodian(record, signer) return FALSE){
+        raise Invalid Transaction Exception which says "Must be owner and custodian to finalize record"
+    }
+
+    IF (record.final return TRUE) {
+        raise Invalid Transaction Exception which says "Record is already final"
+    }
+
+    SET record.final = TRUE
+}
+
+FUNCTION _create_record_type(payload, signer, timestamp, state){
+
+    CALL _verify_agent(state, signer)
+
+    SET name AND properties = payload.name AND payload.properties
+
+    IF (name is NULL) {
+        CALL InvalidTransaction(
+            'Record type name cannot be empty string')
+    }
+
+    IF (properties are NULL) {
+        CALL InvalidTransaction(
+            'Record type must have at least one property')
+    }
+
+    FOR EACH prob in properties {
+        IF (prob.name is NULL){
+            CALL InvalidTransaction(
+            'Property name cannot be empty string')
+        }
+    }
+
+    SET address = CALL addressing.make_record_type_address(name)
+
+    SET container = CALL _get_container(state, address)
+
+    FOR EACH rec_type IN container.entries {
+        IF (name matches with rec_type.name){
+            raise InvalidTransaction(
+                'Record type {the name} already exists')
+        }
+    }
+
+    SET record_type = CALL RecordType(
+        SET name=name,
+        SET properties=properties,
+    )
+
+    CALL ontainer.entries.extend([record_type])
+    CALL container.entries.sort(key=lambda rec_type: rec_type.name)
+
+    CALL _set_container(state, address, container)
+}
+
+FUNCTION _update_properties(payload, signer, timestamp, state){
+    '''
+    * Check that the record is not final
+    * Check that the signer is an authorized reporter
+    * Check that the types are correct
+    '''
+
+    // Check that the record is not final
+    SET record_id = payload.record_id
+    SET record = CALL _get_record(state, record_id)
+
+    IF (record.final is TRUE){
+        raise InvalidTransaction(
+            'Record is final')
+    }
+
+    SET updates = payload.properties
+
+    FOR EACH update IN updates {
+        SET name AND data_type = update.name AND update.data_type
+        SET property_address = CALL addressing.make_property_address(record_id, name)
+        SET property_container = CALL _get_container(state, property_address)
+
+        TRY{
+            SET prop = CALL next(
+                prop WHEN FOR EACH prop IN property_container.entries IF prop.name matches with name
+            )
+        } CATCH Exception {
+            stop iteration
+            raise InvalidTransaction(
+                'Record does not have property'
+            )
+        }
+
+        TRY{
+            SET reporter_index = next(
+                reporter.index WHEN FOR EACH reporter IN prop.reporters IF reporter.public_key matches signer and reporter.authorized
+            )
+        } CATCH Exception {
+            stop iteration
+            raise InvalidTransaction(
+                'Reporter is not authorized'
+            )
+        }
+
+        IF (data_type doesn't match prop.data_type){
+            raise InvalidTransaction(
+                'Update has wrong type')
+        }
+
+        SET page_number = prop.current_page
+        SET page_address = CALL addressing.make_property_address(
+            record_id, name, page_number)
+        SET page_container = CALL _get_container(state, page_address)
+
+        TRY{
+            SET page = CALL next(
+                page WHILE FOR EACH page in page_container.entries IF page.name matches name
+            )
+        } CATCH Exception {
+            stop iteration
+            raise InternalError(
+                'Property page does not exist')
+        }
+
+        SET reported_value = CALL _make_new_reported_value(
+            SET reporter_index=reporter_index,
+            SET timestamp=timestamp,
+            SET prop=update,
+        )
+
+        CALL page.reported_values.extend([reported_value])
+        CALL page.reported_values.sort(
+            key=lambda val: (val.timestamp, val.reporter_index))
+
+        CALL _set_container(state, page_address, page_container)
+
+        // increment page if needed
+
+        IF (length of page.reported_values is more or equal to PROPERTY_PAGE_MAX_LENGTH) {
+            SET new_page_number = (
+                page_number + 1
+                IF (page_number + 1 is less or equal to TOTAL_PROPERTY_PAGE_MAX
+                ELSE 1
+            )
+
+            SET new_page_address = CALL addressing.make_property_address(
+                record_id, name, new_page_number)
+
+            SET new_page_container = _get_container(state, new_page_address)
+
+            TRY{
+                SET new_page = CALL next(
+                    page
+                    WHILE FOR EACH  page IN new_page_container.entries
+                    IF page.name matches name
+                )
+
+                DELETE all values in  new_page.reported_values
+            } CATCH Exception {
+                stop iteration
+                SET new_page = CALL PropertyPage(
+                    SET name=name,
+                    SET record_id=record_id,
+                )
+
+                CALL new_page_container.entries.extend([new_page])
+            }
+        }
+
+        CALL _set_container(state, new_page_address, new_page_container)
+
+        // increment the property's page number (or wrap back to 1)
+        SET prop.current_page = new_page_number
+
+        IF (new_page_number equals to 1 AND prop.wrapped is FALSE):
+            SET prop.wrapped = True
+
+        CALL _set_container(state, property_address, property_container)
+    }
+}
+
+FUNCTION _create_proposal(payload, signer, timestamp, state){
+    SET record_id, receiving_agent AND role AND properties = payload.record_id AND payload.receiving_agent AND payload.role AND payload.properties
+
+    // Verify both agents
+    CALL _verify_agent(state, signer)
+    CALL _verify_agent(state, receiving_agent)
+
+    CALL proposal_address = addressing.make_proposal_address(
+        record_id, receiving_agent)
+    CALL proposal_container = _get_container(state, proposal_address)
+
+    SET open_proposals = [
+        proposal
+        WHILE FOR EACH proposal IN proposal_container.entries
+        IF proposal.status matches Proposal.OPEN
+    ]
+
+    FOR (EACH proposal IN open_proposals) {
+        IF (proposal.receiving_agent matches receiving_agent AND proposal.role matches role AND proposal.record_id matches record_id) {
+            raise InvalidTransaction(
+                'Proposal already exists')  
+        }
+            
+    }
+        
+
+    SET record= _get_record(state, record_id)
+
+    IF (record.final is TRUE){
+        raise InvalidTransaction(
+            'Record is final')
+    }
+        
+
+    IF (role matches Proposal.OWNER OR role matches Proposal.REPORTER) {
+        IF (CALL _is_owner(record, signer) returns FALSE) {
+            raise InvalidTransaction(
+                'Must be owner')
+        }
+    }
+        
+
+    if (role matches Proposal.CUSTODIAN) {
+        if (CALL _is_custodian(record, signer) returns FALSE) {
+            raise InvalidTransaction(
+                'Must be custodian')
+        }
+    }
+        
+
+    SET proposal = CALL Proposal(
+        SET record_id=record_id,
+        SET timestamp=timestamp,
+        SET issuing_agent=signer,
+        SET receiving_agent=receiving_agent,
+        SET role=role,
+        SET properties=properties,
+        SET status=Proposal.OPEN,
+    )
+
+    CALL proposal_container.entries.extend([proposal])
+    CALL proposal_container.entries.sort(
+        key=LAMBDA FUNCTION prop (
+            prop.record_id,
+            prop.receiving_agent,
+            prop.timestamp,
+        )
+    )
+
+    CALL _set_container(state, proposal_address, proposal_container)
+}
+
+FUNCTION _answer_proposal(payload, signer, timestamp, state) {
+    SET record_id AND receiving_agent AND role AND response =  payload.record_id AND payload.receiving_agent AND payload.role AND payload.response
+
+    SET proposal_address = CALL addressing.make_proposal_address(record_id, receiving_agent)
+    SET proposal_container = CALL_get_container(state, proposal_address)
+
+    TRY{
+        SET proposal = CALL next(
+            proposal
+            WHILE FOR EACH proposal IN proposal_container.entries
+            IF (proposal.status matches Proposal.OPEN and proposal.receiving_agent matches receiving_agent and proposal.role matches role)
+        )
+    } CATCH Exception{
+        stop iteration
+        raise InvalidTransaction(
+            'No such open proposal')
+    }
+        
+    if(response matches AnswerProposalAction.CANCEL){
+        IF (proposal.issuing_agent doesn't match signer) {
+            raise InvalidTransaction(
+                'Only the issuing agent can cancel')
+        }
+        SET proposal.status = Proposal.CANCELED
+    }
+
+    ELSE IF  (response matches AnswerProposalAction.REJECT) {
+        IF (proposal.receiving_agent doesn't match signer) {
+            raise InvalidTransaction(
+                'Only the receiving agent can reject')
+        }
+        SET proposal.status = Proposal.REJECTED
+    }
+
+    ELSE IF (response matches AnswerProposalAction.ACCEPT) {
+        IF (proposal.receiving_agent doesn't matches signer) {
+            raise InvalidTransaction(
+                'Only the receiving agent can accept')
+        }
+        SET proposal.status = _accept_proposal(state, signer, proposal, timestamp)
+    }
+        
+
+    SET _set_container(state, proposal_address, proposal_container) 
+}
+
+FUNCTION _accept_proposal(state, signer, proposal, timestamp) {
+    SET record_id AND issuing_agent AND receiving_agent AND role AND properties = proposal.record_id AND proposal.issuing_agent AND proposal.receiving_agent AND proposal.role AND proposal.properties
+
+    SET record AND record_container AND record_address = CALL _get_record(state, record_id)
+
+    IF (role matches Proposal.OWNER) {
+        IF (CALL _is_owner(record, issuing_agent) return FALSE) {
+            CALL LOGGER.info('Issuing agent is not owner')
+            RETURN Proposal.CANCELED
+        }
+
+        CALL record.owners.extend([
+            CALL Record.AssociatedAgent( SET agent_id=receiving_agent,SET timestamp=timestamp)
+        ])
+
+        CALL record.owners.sort(SET key=LAMBDA FUNCTION agent: agent.timestamp)
+
+        CALL _set_container(state, record_address, record_container)
+
+        // Authorize the new owner as a reporter on all of the record's
+        // properties and deauthorize the old owner, leaving everything
+        // else as-is
+        SET record_type = CALL _get_record_type(state, record.record_type)
+
+        FOR EACH prop_name IN (prop.name WHILE FOr EACH prop IN record_type.properties) {
+            SET prop AND prop_container AND prop_address = CALL _get_property(
+                state, record_id, prop_name)
+
+            SET old_owner = CALL next(
+                reporter
+                WHILE FOR EACH reporter IN prop.reporters
+                IF (reporter.public_key matches issuing_agent)
+            )
+
+            SET old_owner.authorized = False
+
+            TRY{
+                SET new_owner = CALL next(
+                    reporter
+                    WHILE FOR EACH reporter IN prop.reporters
+                    IF (reporter.public_key matches receiving_agent)
+                )
+
+                if (new_owner.authorized is FALSE) {
+                    CALL new_owner.authorized = True
+                    SET _set_container(state, prop_address, prop_container)
+                }
+                    
+            } CATCH Exception {
+                SET new_owner = CALL Property.Reporter(
+                    SET public_key=receiving_agent,
+                    SET authorized=True,
+                    SET index=len(prop.reporters),
+                )
+
+                CALL prop.reporters.extend([new_owner])
+
+                CALL _set_container(state, prop_address, prop_container)
+            }
+        }
+            
+
+        RETURN Proposal.ACCEPTED
+    }
+
+    ELSE IF (role matches Proposal.CUSTODIAN) {
+        if (CALL _is_custodian(record, issuing_agent) returns FALSE) {
+            CALL LOGGER.info('Issuing agent is not custodian')
+            RETURN Proposal.CANCELED
+        }
+            
+
+        CALL record.custodians.extend([
+            CALL Record.AssociatedAgent(
+                SET agent_id=receiving_agent,
+                SET timestamp=timestamp)
+        ])
+
+        CALL record.custodians.sort(SET key=LAMBDA FUNCTION agent: agent.timestamp)
+
+        CALL _set_container(state, record_address, record_container)
+
+        RETURN Proposal.ACCEPTED
+    }
+
+    ELSE IF (role matches Proposal.REPORTER) {
+        IF (CALL _is_owner(record, issuing_agent) returns FALSE) {
+            CALL LOGGER.info('Issuing agent is not owner')
+            RETURN Proposal.CANCELED
+        }
+            
+
+        FOR EACH prop_name IN properties {
+            SET prop AND container AND address = CALL _get_property(
+                state, record_id, prop_name)
+
+            CALL prop.reporters.extend([
+                CALL Property.Reporter(
+                    SET public_key=signer,
+                    SET authorized=True,
+                    SET index=len(prop.reporters),
+                )
+            ])
+            
+            CALL _set_container(state, address, container)
+        }
+            
+
+        RETURN Proposal.ACCEPTED
+    }      
+}
+
+FUNCTION _revoke_reporter(payload, signer, timestamp, state) {
+    '''
+    * Check that the signer is the owner
+    * Check that the reporter is actually a reporter
+    * Does it matter if the record is finalized?
+    '''
+    SET record_id AND reporter_id AND properties = payload.record_id AND payload.reporter_id AND payload.properties
+
+    SET record = CALL _get_record(state, record_id)
+
+    IF (CALL _is_owner(record, signer) returns FALSE) {
+        raise InvalidTransaction(
+            'Must be owner to revoke reporters')
+    }
+        
+
+    if (record.final is TRUE) {
+        raise InvalidTransaction(
+            'Record is final')
+    }
+        
+
+    FOR EACH property_name IN properties {
+        SET prop AND property_container AND property_address = CALL _get_property(state, record_id, property_name)
+
+        TRY {
+            SET reporter = CALL next(
+                reporter
+                WHILE FOR EACH reporter IN prop.reporters
+                IF reporter.public_key matches reporter_id
+            )
+
+            if (reporter.authorized is FALSE) {
+                raise InvalidTransaction(
+                    'Reporter has already been revoked')
+            }
+                
+        }
+        
+        CATCH Exception {
+            stop iteration
+            raise InvalidTransaction(
+                'Reporter cannot be revoked')
+        }
+            
+
+        SET reporter.authorized = False
+
+        CALL _set_container(state, property_address, property_container)
+    }
+}
+    
